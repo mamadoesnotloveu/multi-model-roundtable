@@ -16,6 +16,7 @@ from discussion import (
     missing_dependencies,
     run_discussion,
 )
+from file_reader import read_file_text
 
 # 项目根目录的 .env 文件（绝对路径，避免歧义）
 _ENV_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
@@ -27,6 +28,9 @@ _DISC_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "discussion
 
 # 本地设置文件（保存模型名、讨论轮数等非敏感设置，跨刷新/重启保留）
 _SETTINGS_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "settings.json")
+
+# 附件内容最大字数（超出部分截断，避免撑爆上下文）
+MAX_ATTACH_CHARS = 50000
 
 
 def _get_key(env_key: str) -> str:
@@ -93,6 +97,11 @@ def _render_discussion(data: dict) -> None:
     """按统一结构渲染一次讨论（最终方案 + 完整过程）。"""
     st.markdown("## 🎯 最终方案（定稿）")
     st.markdown(data.get("final", "") or "（无内容）")
+
+    atts = data.get("attachments", [])
+    if atts:
+        names = "、".join(a.get("name", "") for a in atts if isinstance(a, dict))
+        st.caption(f"📎 附件：{names}")
 
     with st.expander("📜 完整过程：草案 → 表决 → 定稿", expanded=False):
         st.markdown("### ① 方案草案")
@@ -233,6 +242,32 @@ with tab_new:
         placeholder="例如：如何在家高效健身？ / 我该不该辞职创业？ / 如何给一款新产品定价？",
     )
 
+    uploaded_files = st.file_uploader(
+        "📎 附件（可选）：Word / PPT / Excel，文件内容会被提取成文字供三个模型一起讨论",
+        type=["docx", "pptx", "xlsx"],
+        accept_multiple_files=True,
+    )
+
+    attachments = []
+    attachment_text = ""
+    if uploaded_files:
+        total_chars = 0
+        for uf in uploaded_files:
+            try:
+                txt = read_file_text(uf.name, uf.getvalue())
+            except Exception as exc:
+                st.warning(f"文件 {uf.name} 解析失败：{exc}")
+                continue
+            attachments.append({"name": uf.name, "text": txt})
+            total_chars += len(txt)
+        if attachments:
+            st.caption(f"已读取 {len(attachments)} 个附件，共 {total_chars} 字。")
+            blocks = [f"【附件：{a['name']}】\n{a['text']}" for a in attachments]
+            attachment_text = "\n\n".join(blocks)
+            if len(attachment_text) > MAX_ATTACH_CHARS:
+                attachment_text = attachment_text[:MAX_ATTACH_CHARS] + "\n\n（附件内容过长，已截断）"
+                st.warning(f"附件总字数超过 {MAX_ATTACH_CHARS}，讨论时只使用了前 {MAX_ATTACH_CHARS} 字。")
+
     if len(available) < 2:
         st.warning("至少需要配置 2 个平台的 API Key（.env 文件）才能进行“讨论”。")
 
@@ -269,7 +304,10 @@ with tab_new:
             progress.markdown(f"⏳ {msg}")
 
         with st.spinner("圆桌讨论进行中，请稍候…"):
-            result = run_discussion(topic, participants, drafter, num_rounds, announce)
+            result = run_discussion(
+                topic, participants, drafter, num_rounds, announce,
+                attachment_text=attachment_text,
+            )
         progress.empty()
 
         # 组装成可保存、可回看的统一结构
@@ -278,6 +316,7 @@ with tab_new:
             "time": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             "drafter": drafter.label,
             "num_rounds": num_rounds,
+            "attachments": attachments,
             "per_round": [
                 [{"speaker": u.speaker_label, "round": u.round_no, "content": u.content} for u in rnd]
                 for rnd in result["per_round"]

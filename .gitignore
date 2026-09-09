@@ -16,3 +16,11 @@ settings.json
 
 # 历史讨论存档（个人内容，不提交）
 discussions/
+
+# 导出的 PDF（个人内容，不提交）
+exports/
+
+# 上传的 Office 文档（个人数据，不提交）
+*.docx
+*.pptx
+*.xlsx

@@ -239,6 +239,7 @@ def run_discussion(
     drafter: ModelConfig,
     num_rounds: int,
     progress_cb: Optional[Callable[[str], None]] = None,
+    attachment_text: str = "",
 ) -> dict:
     """执行完整流程：辩论 → 起草 → 表决 → 修订定稿。
 
@@ -259,14 +260,19 @@ def run_discussion(
         if progress_cb:
             progress_cb(msg)
 
+    # 话题 + 附件内容拼成统一上下文，贯穿各阶段
+    context = "话题：{topic}".format(topic=topic)
+    if attachment_text:
+        context += "\n\n【参考附件内容】\n{attachment}".format(attachment=attachment_text)
+
     # 1. 多轮辩论
     for rnd in range(1, num_rounds + 1):
         if rnd == 1:
-            user_message = f"话题：{topic}\n\n请给出你对这个话题的初步分析与建议方案。"
+            user_message = f"{context}\n\n请给出你对这个话题的初步分析与建议方案。"
         else:
             transcript = format_transcript(utterances)
             user_message = (
-                f"话题：{topic}\n\n"
+                f"{context}\n\n"
                 f"以下是目前的讨论记录：\n\n{transcript}\n\n"
                 "请基于以上记录，先指出其中存在的问题或不足，再给出你的改进意见或补充观点。"
             )
@@ -284,7 +290,7 @@ def run_discussion(
     # 2. 起草方案草案
     announce(f"起草人（{drafter.label}）正在起草方案草案…")
     draft_message = (
-        f"话题：{topic}\n\n"
+        f"{context}\n\n"
         f"以下是完整的讨论记录：\n\n{transcript}\n\n"
         "请起草一份「结论方案草案」，要求：\n"
         "- 结构清晰，包含：核心结论、具体方案、当前仍存在的分歧点；\n"
@@ -300,7 +306,7 @@ def run_discussion(
     # 3. 各方表决（盖章）
     announce("各成员正在表决（盖章）…")
     vote_message = (
-        f"话题：{topic}\n\n"
+        f"{context}\n\n"
         f"以下是方案草案：\n\n{draft}\n\n"
         f"（供参考）完整讨论记录：\n\n{transcript}\n\n"
         "请按模板对该草案进行表决。"
@@ -311,7 +317,7 @@ def run_discussion(
     announce("起草人正在综合表决结果，产出最终定稿…")
     votes_text = format_votes(votes)
     finalize_message = (
-        f"话题：{topic}\n\n"
+        f"{context}\n\n"
         f"方案草案：\n\n{draft}\n\n"
         f"各方表决结果：\n\n{votes_text}\n\n"
         "请产出最终定稿（【最终方案】【各方盖章】【保留分歧】三部分）。"
