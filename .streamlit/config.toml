@@ -1,0 +1,9 @@
+[server]
+# 只监听本机回环地址，外网/局域网其他设备都无法访问
+address = "127.0.0.1"
+port = 8501
+headless = true
+
+[browser]
+# 关闭使用数据上报（隐私）
+gatherUsageStats = false

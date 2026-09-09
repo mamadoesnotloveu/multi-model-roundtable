@@ -1,0 +1,18 @@
+# 虚拟环境
+venv/
+
+# Python 缓存
+__pycache__/
+*.pyc
+
+# macOS 系统文件
+.DS_Store
+
+# 本地密钥（永远不要提交）
+.env
+
+# 本地设置（自动生成，无需提交）
+settings.json
+
+# 历史讨论存档（个人内容，不提交）
+discussions/
