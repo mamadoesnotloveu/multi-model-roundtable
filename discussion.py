@@ -17,8 +17,12 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import Callable, Iterator, Optional
 
-# 每次回复的最大 token 数
-MAX_TOKENS = 4096
+# 各阶段的最大输出 token 数（推理模型会把一部分额度用于“思考”，需留足余量）
+MAX_TOKENS = 8192          # 辩论每轮发言
+DRAFT_MAX_TOKENS = 16384   # 起草方案草案
+VOTE_MAX_TOKENS = 2048     # 表决（模板输出，较短）
+FINAL_MAX_TOKENS = 16384   # 评委最终裁决
+CONVERGE_MAX_TOKENS = 512  # 收敛判断（只回两个字）
 # 讨论温度（越高越发散，越低越保守）
 TEMPERATURE = 0.7
 
@@ -142,7 +146,7 @@ def _build_messages(system: str, user_message: str) -> list:
     ]
 
 
-def call_model(cfg: ModelConfig, system: str, user_message: str) -> str:
+def call_model(cfg: ModelConfig, system: str, user_message: str, max_tokens: int = MAX_TOKENS) -> str:
     """调用单个模型，返回其文本回复。失败会抛出异常。"""
     if cfg.provider == "claude":
         from anthropic import Anthropic
@@ -150,7 +154,7 @@ def call_model(cfg: ModelConfig, system: str, user_message: str) -> str:
         client = Anthropic(api_key=cfg.api_key, base_url=cfg.base_url or None)
         resp = client.messages.create(
             model=cfg.name,
-            max_tokens=MAX_TOKENS,
+            max_tokens=max_tokens,
             system=system,
             messages=[{"role": "user", "content": user_message}],
         )
@@ -172,14 +176,14 @@ def call_model(cfg: ModelConfig, system: str, user_message: str) -> str:
         try:
             resp = client.chat.completions.create(
                 model=cfg.name,
-                max_completion_tokens=MAX_TOKENS,
+                max_completion_tokens=max_tokens,
                 messages=messages,
             )
         except Exception as exc:
             if "max_completion_tokens" in str(exc) or "max_tokens" in str(exc):
                 resp = client.chat.completions.create(
                     model=cfg.name,
-                    max_tokens=MAX_TOKENS,
+                    max_tokens=max_tokens,
                     messages=messages,
                 )
             else:
@@ -189,14 +193,14 @@ def call_model(cfg: ModelConfig, system: str, user_message: str) -> str:
         resp = client.chat.completions.create(
             model=cfg.name,
             temperature=TEMPERATURE,
-            max_tokens=MAX_TOKENS,
+            max_tokens=max_tokens,
             messages=messages,
         )
 
     return (resp.choices[0].message.content or "").strip()
 
 
-def call_model_stream(cfg: ModelConfig, system: str, user_message: str) -> Iterator[str]:
+def call_model_stream(cfg: ModelConfig, system: str, user_message: str, max_tokens: int = MAX_TOKENS) -> Iterator[str]:
     """流式调用单个模型，逐段 yield 文本。"""
     if cfg.provider == "claude":
         from anthropic import Anthropic
@@ -204,7 +208,7 @@ def call_model_stream(cfg: ModelConfig, system: str, user_message: str) -> Itera
         client = Anthropic(api_key=cfg.api_key, base_url=cfg.base_url or None)
         with client.messages.stream(
             model=cfg.name,
-            max_tokens=MAX_TOKENS,
+            max_tokens=max_tokens,
             system=system,
             messages=[{"role": "user", "content": user_message}],
         ) as stream:
@@ -220,10 +224,10 @@ def call_model_stream(cfg: ModelConfig, system: str, user_message: str) -> Itera
     messages = _build_messages(system, user_message)
     kwargs = dict(model=cfg.name, stream=True, messages=messages)
     if cfg.provider == "openai":
-        kwargs["max_completion_tokens"] = MAX_TOKENS
+        kwargs["max_completion_tokens"] = max_tokens
     else:
         kwargs["temperature"] = TEMPERATURE
-        kwargs["max_tokens"] = MAX_TOKENS
+        kwargs["max_tokens"] = max_tokens
 
     resp = client.chat.completions.create(**kwargs)
     for chunk in resp:
@@ -313,7 +317,7 @@ def _check_convergence(checker: ModelConfig, context: str, transcript: str) -> b
         "请判断以上讨论是否已收敛（各方没有新的实质性分歧、观点已趋于一致）。只回复两个字：收敛 或 未收敛"
     ).format(context=context, transcript=transcript)
     try:
-        ans = call_model(checker, CONVERGE_SYSTEM, msg).strip()
+        ans = call_model(checker, CONVERGE_SYSTEM, msg, max_tokens=CONVERGE_MAX_TOKENS).strip()
     except Exception:
         return False
     return "收敛" in ans and "未" not in ans
@@ -329,6 +333,15 @@ def _tally_votes(votes: list) -> dict:
         else:
             counts["未识别"] += 1
     return counts
+
+
+def _call_with_retry(cfg: ModelConfig, system: str, user_message: str, max_tokens: int, retries: int = 2) -> str:
+    """调用模型；若返回空内容则重试，最后仍为空则抛出异常。"""
+    for _ in range(retries + 1):
+        out = call_model(cfg, system, user_message, max_tokens=max_tokens).strip()
+        if out:
+            return out
+    raise RuntimeError("连续多次返回空内容")
 
 
 def run_discussion(
@@ -419,7 +432,7 @@ def run_discussion(
         "- 草案要足够具体，便于其他成员逐条表决。"
     ).format(context=context, transcript=transcript)
     try:
-        draft = call_model(drafter, DRAFTER_SYSTEM, draft_message)
+        draft = _call_with_retry(drafter, DRAFTER_SYSTEM, draft_message, DRAFT_MAX_TOKENS)
     except Exception as exc:
         errors.append("起草人（{label}）起草失败：{exc}".format(label=drafter.label, exc=exc))
         draft = "（起草失败：{exc}）".format(exc=exc)
@@ -435,7 +448,7 @@ def run_discussion(
 
     def _vote_worker(cfg: ModelConfig) -> Vote:
         try:
-            content = call_model(cfg, VOTER_SYSTEM, vote_message)
+            content = _call_with_retry(cfg, VOTER_SYSTEM, vote_message, VOTE_MAX_TOKENS)
         except Exception as exc:
             errors.append("{label}（表决）调用失败：{exc}".format(label=cfg.label, exc=exc))
             content = "（表决调用失败：{exc}）".format(exc=exc)
@@ -460,7 +473,7 @@ def run_discussion(
         "输出四部分：【最终方案】【各方盖章】【保留分歧】【依据说明】。"
     ).format(context=context, draft=draft, votes_text=votes_text, tally_text=tally_text)
     try:
-        final = call_model(judge, JUDGE_SYSTEM, judge_message)
+        final = _call_with_retry(judge, JUDGE_SYSTEM, judge_message, FINAL_MAX_TOKENS)
     except Exception as exc:
         errors.append("评委（{label}）裁决失败：{exc}".format(label=judge.label, exc=exc))
         final = "（裁决失败：{exc}）".format(exc=exc)

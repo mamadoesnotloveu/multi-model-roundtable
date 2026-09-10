@@ -2,8 +2,9 @@
 """把历史讨论导出为 PDF。
 
 用法：
-    ./venv/bin/python export_pdf.py                  # 导出最近一次讨论
-    ./venv/bin/python export_pdf.py <文件名.json>     # 导出指定讨论（文件名在 discussions/ 下）
+    ./venv/bin/python export_pdf.py                    # 导出最近一次讨论
+    ./venv/bin/python export_pdf.py <文件名.json>       # 导出指定讨论（文件名在 discussions/ 下）
+    ./venv/bin/python export_pdf.py --no-attachments   # 导出时不包含附件内容（只含话题文字）
 """
 import json
 import os
@@ -80,7 +81,7 @@ def styles():
     }
 
 
-def build_story(data, s):
+def build_story(data, s, include_attachments=True):
     story = []
     story.append(Paragraph("多模型圆桌讨论", s["title"]))
     story.append(Paragraph("Claude · GPT · DeepSeek　辩论 → 起草 → 表决 → 定稿", s["subtitle"]))
@@ -100,15 +101,16 @@ def build_story(data, s):
     story.append(Paragraph(esc(meta), s["meta"]))
     story.append(Spacer(1, 4))
 
-    # 附件
-    atts = data.get("attachments", [])
-    if atts:
-        story.append(Paragraph("附件", s["h1"]))
-        for a in atts:
-            if not isinstance(a, dict):
-                continue
-            story.append(Paragraph(esc(a.get("name", "")), s["speaker"]))
-            story.append(Paragraph(esc(a.get("text", "")) or "（无内容）", s["body"]))
+    # 附件（可选）
+    if include_attachments:
+        atts = data.get("attachments", [])
+        if atts:
+            story.append(Paragraph("附件", s["h1"]))
+            for a in atts:
+                if not isinstance(a, dict):
+                    continue
+                story.append(Paragraph(esc(a.get("name", "")), s["speaker"]))
+                story.append(Paragraph(esc(a.get("text", "")) or "（无内容）", s["body"]))
 
     # 最终方案
     story.append(Paragraph("一、最终方案（评委裁决）", s["h1"]))
@@ -164,8 +166,11 @@ def footer(canvas, doc):
 def main():
     register_font()
 
-    if len(sys.argv) > 1:
-        src = sys.argv[1]
+    include_attachments = "--no-attachments" not in sys.argv
+    args = [a for a in sys.argv[1:] if a != "--no-attachments"]
+
+    if args:
+        src = args[0]
         if not os.path.isabs(src):
             src = os.path.join(DISC_DIR, src)
     else:
@@ -193,7 +198,7 @@ def main():
         topMargin=18 * mm, bottomMargin=20 * mm,
         title="圆桌讨论：{}".format(data.get("topic", "")[:40]),
     )
-    doc.build(build_story(data, styles()), onFirstPage=footer, onLaterPages=footer)
+    doc.build(build_story(data, styles(), include_attachments), onFirstPage=footer, onLaterPages=footer)
     print("已生成 PDF：{}".format(out_path))
     return 0
 
