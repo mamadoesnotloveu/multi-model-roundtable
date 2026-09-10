@@ -1,18 +1,21 @@
 """多模型圆桌讨论的核心逻辑。
 
 完整流程：
-1. 多轮辩论：各模型轮流发言、互相点评反驳；
-2. 起草：由起草人（默认 DeepSeek，可配置）根据讨论起草方案草案；
-3. 表决（盖章）：每个模型对草案给出「同意 / 部分同意 / 不同意」的独立表态；
-4. 修订定稿：起草人综合各方表态，产出最终定稿（最终方案 + 各方盖章 + 保留分歧）。
+1. 多轮辩论（自适应收敛）：各模型（运动员）轮流发言、互相点评反驳，观点收敛时提前结束；
+2. 起草：起草人（运动员之一）根据讨论起草方案草案；
+3. 表决（盖章）：每个运动员对草案给出「同意 / 部分同意 / 不同意」的独立表态；
+4. 独立评委最终裁决：评委（不属于运动员）按「少数服从多数」原则做最终裁决。
 
 本文件不依赖 Streamlit，可以单独测试或复用。
 """
 from __future__ import annotations
 
+import queue
+import re
+import threading
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
-from typing import Callable, Optional
+from typing import Callable, Iterator, Optional
 
 # 每次回复的最大 token 数
 MAX_TOKENS = 4096
@@ -24,6 +27,7 @@ DEFAULT_MODELS = {
     "claude": "claude-sonnet-5",
     "openai": "gpt-5.6-terra",
     "deepseek": "deepseek-v4-pro",
+    "grok": "grok-4.6",
 }
 
 # 平台显示名
@@ -31,13 +35,20 @@ PROVIDER_LABELS = {
     "claude": "Claude",
     "openai": "OpenAI",
     "deepseek": "DeepSeek",
+    "grok": "Grok",
+}
+
+# OpenAI 兼容接口的自定义 base_url（openai 用官方默认 None）
+_OPENAI_COMPAT_BASE = {
+    "deepseek": "https://api.deepseek.com",
+    "grok": "https://api.x.ai/v1",
 }
 
 
 @dataclass
 class ModelConfig:
-    """单个参与模型 / 起草人的配置。"""
-    provider: str      # "claude" | "openai" | "deepseek"
+    """单个参与模型 / 起草人 / 评委的配置。"""
+    provider: str      # "claude" | "openai" | "deepseek" | "grok"
     name: str          # 模型名
     api_key: str
     label: str         # 显示名
@@ -59,14 +70,15 @@ class Vote:
     content: str
 
 
-# 辩手（参与者）的系统提示词
+# 辩手（运动员）的系统提示词
 DEBATER_SYSTEM = (
-    "你是一位圆桌讨论的参与者，正在与其他几位大模型一起讨论同一个话题。\n"
+    "你是一位圆桌讨论的参与者（运动员），正在与其他几位大模型一起讨论同一个话题。\n"
     "请遵守以下规则：\n"
-    "1. 认真阅读已有的讨论记录；\n"
+    "1. 认真阅读已有的讨论记录和参考附件；\n"
     "2. 主动指出他人观点中的漏洞、风险或考虑不周之处，不要一味附和；\n"
     "3. 给出你自己的独立判断、方案或补充；\n"
-    "4. 语言简洁、直接、具体，避免空话套话。"
+    "4. 观点要有依据：尽量引用附件或讨论中的具体内容，而非空泛断言；\n"
+    "5. 语言简洁、直接、具体，避免空话套话。"
 )
 
 # 起草人的系统提示词
@@ -76,7 +88,8 @@ DRAFTER_SYSTEM = (
     "1. 客观综合各方观点，不偏袒任何一方；\n"
     "2. 草案要具体、可执行，结构清晰；\n"
     "3. 对确实存在的分歧，如实在草案中标注出来；\n"
-    "4. 本阶段只输出方案草案，不要下最终结论。"
+    "4. 关键结论尽量标注依据来源；\n"
+    "5. 本阶段只输出方案草案，不要下最终结论。"
 )
 
 # 表决（盖章）时的系统提示词
@@ -92,18 +105,23 @@ VOTER_SYSTEM = (
     "修改建议：（若立场为“同意”，写“无”）"
 )
 
-# 修订定稿时的系统提示词
-FINALIZER_SYSTEM = (
-    "你是一位圆桌讨论的起草人（主持人），现在要根据各成员的投票表决结果，产出最终定稿。\n"
+# 独立评委的系统提示词
+JUDGE_SYSTEM = (
+    "你是一位独立评委/仲裁者，不属于参与讨论的任何一方。\n"
+    "你的任务是基于方案草案和各方表决，做出公正的最终裁决。\n"
     "要求：\n"
-    "1. 吸收合理、可执行的修改建议；\n"
-    "2. 对未采纳的建议，说明原因或列入保留分歧；\n"
-    "3. 如实记录每个成员的立场，不虚构一致；\n"
-    "4. 严格按以下三部分输出，标题用【】括起来：\n"
+    "1. 不偏袒任何一方；\n"
+    "2. 按「少数服从多数」原则采纳多数意见，同时如实保留少数意见；\n"
+    "3. 关键结论要给出依据说明；\n"
+    "4. 严格按以下四部分输出，标题用【】括起来：\n"
     "【最终方案】综合各方意见后的最终方案\n"
     "【各方盖章】每个成员的立场与理由\n"
-    "【保留分歧】仍无法调和的分歧及各方立场"
+    "【保留分歧】仍无法调和的分歧及各方立场\n"
+    "【依据说明】关键结论的主要依据/证据来源"
 )
+
+# 收敛判断
+CONVERGE_SYSTEM = "你是讨论收敛判断助手。只回复「收敛」或「未收敛」两个字。"
 
 
 def missing_dependencies() -> list:
@@ -115,6 +133,13 @@ def missing_dependencies() -> list:
         except ImportError:
             missing.append(mod)
     return missing
+
+
+def _build_messages(system: str, user_message: str) -> list:
+    return [
+        {"role": "system", "content": system},
+        {"role": "user", "content": user_message},
+    ]
 
 
 def call_model(cfg: ModelConfig, system: str, user_message: str) -> str:
@@ -135,21 +160,15 @@ def call_model(cfg: ModelConfig, system: str, user_message: str) -> str:
                 parts.append(block.text)
         return "".join(parts).strip()
 
-    # OpenAI 与 DeepSeek 都是 OpenAI 兼容接口，只是 base_url 不同
+    # OpenAI 兼容：openai / deepseek / grok
     from openai import OpenAI
 
-    base_url = "https://api.deepseek.com" if cfg.provider == "deepseek" else None
+    base_url = _OPENAI_COMPAT_BASE.get(cfg.provider)  # openai -> None
     client = OpenAI(api_key=cfg.api_key, base_url=base_url)
-
-    messages = [
-        {"role": "system", "content": system},
-        {"role": "user", "content": user_message},
-    ]
+    messages = _build_messages(system, user_message)
 
     if cfg.provider == "openai":
-        # 新版 OpenAI 推理模型（gpt-5.x / o 系列）：
-        # 1) 用 max_completion_tokens 而非 max_tokens；
-        # 2) 不支持自定义 temperature（只能用默认值），故这里不传 temperature。
+        # 新版 OpenAI 推理模型（gpt-5.x）用 max_completion_tokens，且不支持自定义 temperature
         try:
             resp = client.chat.completions.create(
                 model=cfg.name,
@@ -157,7 +176,6 @@ def call_model(cfg: ModelConfig, system: str, user_message: str) -> str:
                 messages=messages,
             )
         except Exception as exc:
-            # 个别旧模型仍只认 max_tokens，这里兜底重试一次
             if "max_completion_tokens" in str(exc) or "max_tokens" in str(exc):
                 resp = client.chat.completions.create(
                     model=cfg.name,
@@ -167,7 +185,7 @@ def call_model(cfg: ModelConfig, system: str, user_message: str) -> str:
             else:
                 raise
     else:
-        # DeepSeek 用 max_tokens
+        # deepseek / grok：标准 OpenAI 兼容参数
         resp = client.chat.completions.create(
             model=cfg.name,
             temperature=TEMPERATURE,
@@ -178,11 +196,47 @@ def call_model(cfg: ModelConfig, system: str, user_message: str) -> str:
     return (resp.choices[0].message.content or "").strip()
 
 
+def call_model_stream(cfg: ModelConfig, system: str, user_message: str) -> Iterator[str]:
+    """流式调用单个模型，逐段 yield 文本。"""
+    if cfg.provider == "claude":
+        from anthropic import Anthropic
+
+        client = Anthropic(api_key=cfg.api_key, base_url=cfg.base_url or None)
+        with client.messages.stream(
+            model=cfg.name,
+            max_tokens=MAX_TOKENS,
+            system=system,
+            messages=[{"role": "user", "content": user_message}],
+        ) as stream:
+            for text in stream.text_stream:
+                if text:
+                    yield text
+        return
+
+    from openai import OpenAI
+
+    base_url = _OPENAI_COMPAT_BASE.get(cfg.provider)
+    client = OpenAI(api_key=cfg.api_key, base_url=base_url)
+    messages = _build_messages(system, user_message)
+    kwargs = dict(model=cfg.name, stream=True, messages=messages)
+    if cfg.provider == "openai":
+        kwargs["max_completion_tokens"] = MAX_TOKENS
+    else:
+        kwargs["temperature"] = TEMPERATURE
+        kwargs["max_tokens"] = MAX_TOKENS
+
+    resp = client.chat.completions.create(**kwargs)
+    for chunk in resp:
+        if chunk.choices and chunk.choices[0].delta and chunk.choices[0].delta.content:
+            yield chunk.choices[0].delta.content
+
+
 def format_transcript(utterances: list) -> str:
     """把辩论发言列表拼成一段可读的讨论记录文本。"""
     lines = []
     for u in utterances:
-        lines.append(f"【{u.speaker_label} · 第 {u.round_no} 轮】\n{u.content}")
+        lines.append("【{speaker} · 第 {rnd} 轮】\n{content}".format(
+            speaker=u.speaker_label, rnd=u.round_no, content=u.content))
     return "\n\n".join(lines)
 
 
@@ -190,152 +244,239 @@ def format_votes(votes: list) -> str:
     """把表决结果拼成一段文本。"""
     lines = []
     for v in votes:
-        lines.append(f"【{v.voter_label}】\n{v.content}")
+        lines.append("【{voter}】\n{content}".format(voter=v.voter_label, content=v.content))
     return "\n\n".join(lines)
 
 
 def _call_participants_parallel(
-    participants: list,
-    system: str,
-    user_message: str,
-    round_no: int,
-    errors: list,
+    participants: list, system: str, user_message: str, round_no: int, errors: list,
 ) -> list:
-    """同一轮内并发调用所有参与模型（它们彼此独立）。"""
+    """同一轮内并发调用所有参与模型（非流式）。"""
     def worker(cfg: ModelConfig) -> Utterance:
         try:
             content = call_model(cfg, system, user_message)
-        except Exception as exc:  # 单个模型失败不拖垮整轮
-            errors.append(f"{cfg.label}（第 {round_no} 轮）调用失败：{exc}")
-            content = f"（本轮调用失败，未产生回复：{exc}）"
+        except Exception as exc:
+            errors.append("{label}（第 {rnd} 轮）调用失败：{exc}".format(
+                label=cfg.label, rnd=round_no, exc=exc))
+            content = "（本轮调用失败，未产生回复：{exc}）".format(exc=exc)
         return Utterance(cfg.label, round_no, content)
 
     with ThreadPoolExecutor(max_workers=len(participants)) as executor:
         return list(executor.map(worker, participants))
 
 
-def _call_voters_parallel(
-    participants: list,
-    system: str,
-    user_message: str,
-    errors: list,
+def _call_participants_streaming(
+    participants: list, system: str, user_message: str, round_no: int, errors: list,
+    on_chunk: Optional[Callable[[str, str], None]],
 ) -> list:
-    """表决阶段并发调用所有参与模型。"""
-    def worker(cfg: ModelConfig) -> Vote:
-        try:
-            content = call_model(cfg, system, user_message)
-        except Exception as exc:  # 单个模型失败不拖垮整轮
-            errors.append(f"{cfg.label}（表决）调用失败：{exc}")
-            content = f"（表决调用失败：{exc}）"
-        return Vote(cfg.label, content)
+    """同一轮内并发流式调用所有参与模型，主线程逐段回调 on_chunk(label, text)。"""
+    n = len(participants)
+    q = queue.Queue()
 
-    with ThreadPoolExecutor(max_workers=len(participants)) as executor:
-        return list(executor.map(worker, participants))
+    def worker(cfg: ModelConfig) -> None:
+        try:
+            for text in call_model_stream(cfg, system, user_message):
+                q.put((cfg.label, text, False))
+        except Exception as exc:
+            errors.append("{label}（第 {rnd} 轮）调用失败：{exc}".format(
+                label=cfg.label, rnd=round_no, exc=exc))
+            q.put((cfg.label, "（本轮调用失败，未产生回复：{exc}）".format(exc=exc), False))
+        q.put((cfg.label, "", True))  # 完成标记
+
+    threads = [threading.Thread(target=worker, args=(cfg,)) for cfg in participants]
+    for t in threads:
+        t.start()
+
+    texts = {cfg.label: "" for cfg in participants}
+    done = 0
+    while done < n:
+        try:
+            label, text, is_done = q.get(timeout=0.05)
+        except queue.Empty:
+            continue
+        if is_done:
+            done += 1
+        else:
+            texts[label] += text
+            if on_chunk:
+                on_chunk(label, text)
+
+    for t in threads:
+        t.join()
+    return [Utterance(cfg.label, round_no, texts[cfg.label]) for cfg in participants]
+
+
+def _check_convergence(checker: ModelConfig, context: str, transcript: str) -> bool:
+    """用某个模型判断讨论是否已收敛。"""
+    msg = (
+        "{context}\n\n以下是讨论记录：\n\n{transcript}\n\n"
+        "请判断以上讨论是否已收敛（各方没有新的实质性分歧、观点已趋于一致）。只回复两个字：收敛 或 未收敛"
+    ).format(context=context, transcript=transcript)
+    try:
+        ans = call_model(checker, CONVERGE_SYSTEM, msg).strip()
+    except Exception:
+        return False
+    return "收敛" in ans and "未" not in ans
+
+
+def _tally_votes(votes: list) -> dict:
+    """从表决文本里解析立场并计数。"""
+    counts = {"同意": 0, "部分同意": 0, "不同意": 0, "未识别": 0}
+    for v in votes:
+        m = re.search(r"立场[:：]\s*(部分同意|不同意|同意)", v.content)
+        if m:
+            counts[m.group(1)] += 1
+        else:
+            counts["未识别"] += 1
+    return counts
 
 
 def run_discussion(
     topic: str,
     participants: list,
     drafter: ModelConfig,
+    judge: ModelConfig,
     num_rounds: int,
-    progress_cb: Optional[Callable[[str], None]] = None,
+    event_cb: Optional[Callable[[dict], None]] = None,
     attachment_text: str = "",
 ) -> dict:
-    """执行完整流程：辩论 → 起草 → 表决 → 修订定稿。
+    """执行完整流程：辩论（自适应收敛）→ 起草 → 表决 → 独立评委裁决。
 
-    返回结构：
-        topic        话题
-        per_round    每轮辩论发言（list[list[Utterance]]）
-        transcript   完整辩论记录文本
-        draft        起草人产出的方案草案
-        votes        各方表决结果（list[Vote]）
-        final        最终定稿（最终方案 + 各方盖章 + 保留分歧）
-        errors       过程中出现的错误信息
+    event_cb（可选）接收事件字典：
+        {"type": "status", "msg": str}                进度提示
+        {"type": "round_start", "round": int, "total": int, "labels": [str]}  一轮辩论开始
+        {"type": "chunk", "label": str, "text": str}  某运动员的流式文本片段
+        {"type": "round_end", "round": int}           一轮辩论结束
+
+    返回结构：topic / per_round / rounds_run / converged / transcript /
+             draft / votes / vote_tally / final / judge / errors
     """
     errors: list = []
     utterances: list = []
     per_round: list = []
 
-    def announce(msg: str) -> None:
-        if progress_cb:
-            progress_cb(msg)
+    def emit(**ev: dict) -> None:
+        if event_cb:
+            event_cb(ev)
 
-    # 话题 + 附件内容拼成统一上下文，贯穿各阶段
+    # 话题 + 附件内容拼成统一上下文
     context = "话题：{topic}".format(topic=topic)
     if attachment_text:
         context += "\n\n【参考附件内容】\n{attachment}".format(attachment=attachment_text)
 
-    # 1. 多轮辩论
+    # 1. 多轮辩论（自适应收敛）
+    converged = False
+    rounds_run = 0
     for rnd in range(1, num_rounds + 1):
         if rnd == 1:
-            user_message = f"{context}\n\n请给出你对这个话题的初步分析与建议方案。"
+            user_message = (
+                "{context}\n\n请给出你对这个话题的初步分析与建议方案，"
+                "并说明你的核心依据（尽量引用附件或事实，而非空泛判断）。"
+            ).format(context=context)
         else:
             transcript = format_transcript(utterances)
             user_message = (
-                f"{context}\n\n"
-                f"以下是目前的讨论记录：\n\n{transcript}\n\n"
-                "请基于以上记录，先指出其中存在的问题或不足，再给出你的改进意见或补充观点。"
-            )
+                "{context}\n\n"
+                "以下是目前的讨论记录：\n\n{transcript}\n\n"
+                "请基于以上记录，先指出其中存在的问题或不足（给出依据），再给出你的改进意见或补充观点。"
+            ).format(context=context, transcript=transcript)
 
-        announce(f"第 {rnd}/{num_rounds} 轮：几位模型正在同时发言…")
-        round_utterances = _call_participants_parallel(
-            participants, DEBATER_SYSTEM, user_message, rnd, errors
-        )
+        emit(type="status", msg="第 {rnd}/{total} 轮：几位模型正在同时发言…".format(rnd=rnd, total=num_rounds))
+        emit(type="round_start", round=rnd, total=num_rounds, labels=[p.label for p in participants])
+        if event_cb:
+            round_utterances = _call_participants_streaming(
+                participants, DEBATER_SYSTEM, user_message, rnd, errors,
+                on_chunk=lambda label, text, rnd=rnd: emit(type="chunk", label=label, text=text),
+            )
+        else:
+            round_utterances = _call_participants_parallel(
+                participants, DEBATER_SYSTEM, user_message, rnd, errors)
         utterances.extend(round_utterances)
         per_round.append(round_utterances)
-        announce(f"第 {rnd}/{num_rounds} 轮完成")
+        rounds_run = rnd
+        emit(type="round_end", round=rnd)
+        emit(type="status", msg="第 {rnd}/{total} 轮完成".format(rnd=rnd, total=num_rounds))
+
+        # 从第 2 轮起判断是否收敛
+        if rnd >= 2:
+            emit(type="status", msg="正在判断讨论是否已收敛…")
+            if _check_convergence(drafter, context, format_transcript(utterances)):
+                converged = True
+                emit(type="status", msg="观点已收敛，提前结束辩论。")
+                break
 
     transcript = format_transcript(utterances)
 
     # 2. 起草方案草案
-    announce(f"起草人（{drafter.label}）正在起草方案草案…")
+    emit(type="status", msg="起草人（{label}）正在起草方案草案…".format(label=drafter.label))
     draft_message = (
-        f"{context}\n\n"
-        f"以下是完整的讨论记录：\n\n{transcript}\n\n"
+        "{context}\n\n"
+        "以下是完整的讨论记录：\n\n{transcript}\n\n"
         "请起草一份「结论方案草案」，要求：\n"
         "- 结构清晰，包含：核心结论、具体方案、当前仍存在的分歧点；\n"
+        "- 关键结论尽量标注依据来源；\n"
         "- 语言简洁、可执行；\n"
         "- 草案要足够具体，便于其他成员逐条表决。"
-    )
+    ).format(context=context, transcript=transcript)
     try:
         draft = call_model(drafter, DRAFTER_SYSTEM, draft_message)
-    except Exception as exc:  # 起草失败也要把错误带回去
-        errors.append(f"起草人（{drafter.label}）起草失败：{exc}")
-        draft = f"（起草失败：{exc}）"
+    except Exception as exc:
+        errors.append("起草人（{label}）起草失败：{exc}".format(label=drafter.label, exc=exc))
+        draft = "（起草失败：{exc}）".format(exc=exc)
 
     # 3. 各方表决（盖章）
-    announce("各成员正在表决（盖章）…")
+    emit(type="status", msg="各成员正在表决（盖章）…")
     vote_message = (
-        f"{context}\n\n"
-        f"以下是方案草案：\n\n{draft}\n\n"
-        f"（供参考）完整讨论记录：\n\n{transcript}\n\n"
+        "{context}\n\n"
+        "以下是方案草案：\n\n{draft}\n\n"
+        "（供参考）完整讨论记录：\n\n{transcript}\n\n"
         "请按模板对该草案进行表决。"
-    )
-    votes = _call_voters_parallel(participants, VOTER_SYSTEM, vote_message, errors)
+    ).format(context=context, draft=draft, transcript=transcript)
 
-    # 4. 修订定稿
-    announce("起草人正在综合表决结果，产出最终定稿…")
+    def _vote_worker(cfg: ModelConfig) -> Vote:
+        try:
+            content = call_model(cfg, VOTER_SYSTEM, vote_message)
+        except Exception as exc:
+            errors.append("{label}（表决）调用失败：{exc}".format(label=cfg.label, exc=exc))
+            content = "（表决调用失败：{exc}）".format(exc=exc)
+        return Vote(cfg.label, content)
+
+    with ThreadPoolExecutor(max_workers=len(participants)) as executor:
+        votes = list(executor.map(_vote_worker, participants))
+
+    vote_tally = _tally_votes(votes)
+
+    # 4. 独立评委最终裁决
+    emit(type="status", msg="独立评委（{label}）正在做最终裁决…".format(label=judge.label))
     votes_text = format_votes(votes)
-    finalize_message = (
-        f"{context}\n\n"
-        f"方案草案：\n\n{draft}\n\n"
-        f"各方表决结果：\n\n{votes_text}\n\n"
-        "请产出最终定稿（【最终方案】【各方盖章】【保留分歧】三部分）。"
-    )
+    tally_text = "同意 {a} 票，部分同意 {b} 票，不同意 {c} 票".format(
+        a=vote_tally["同意"], b=vote_tally["部分同意"], c=vote_tally["不同意"])
+    judge_message = (
+        "{context}\n\n"
+        "方案草案：\n\n{draft}\n\n"
+        "各方表决结果：\n\n{votes_text}\n\n"
+        "表决统计：{tally_text}。\n\n"
+        "请作为独立评委做出最终裁决：按「少数服从多数」原则采纳多数意见，同时如实保留少数意见；"
+        "输出四部分：【最终方案】【各方盖章】【保留分歧】【依据说明】。"
+    ).format(context=context, draft=draft, votes_text=votes_text, tally_text=tally_text)
     try:
-        final = call_model(drafter, FINALIZER_SYSTEM, finalize_message)
-    except Exception as exc:  # 定稿失败也要把错误带回去
-        errors.append(f"起草人（{drafter.label}）定稿失败：{exc}")
-        final = f"（定稿失败：{exc}）"
+        final = call_model(judge, JUDGE_SYSTEM, judge_message)
+    except Exception as exc:
+        errors.append("评委（{label}）裁决失败：{exc}".format(label=judge.label, exc=exc))
+        final = "（裁决失败：{exc}）".format(exc=exc)
 
-    announce("完成")
+    emit(type="status", msg="完成")
 
     return {
         "topic": topic,
         "per_round": per_round,
+        "rounds_run": rounds_run,
+        "converged": converged,
         "transcript": transcript,
         "draft": draft,
         "votes": votes,
+        "vote_tally": vote_tally,
         "final": final,
+        "judge": judge.label,
         "errors": errors,
     }

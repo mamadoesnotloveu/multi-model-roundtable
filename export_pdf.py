@@ -91,8 +91,12 @@ def build_story(data, s):
     # 话题
     story.append(Paragraph("话题", s["h1"]))
     story.append(Paragraph(esc(data.get("topic", "")), s["body"]))
-    meta = "时间：{time}　|　讨论轮数：{n}　|　起草人：{d}".format(
-        time=data.get("time", ""), n=data.get("num_rounds", ""), d=data.get("drafter", ""))
+    tally = data.get("vote_tally") or {}
+    tally_text = "同意{a}/部分同意{b}/不同意{c}".format(
+        a=tally.get("同意", 0), b=tally.get("部分同意", 0), c=tally.get("不同意", 0))
+    meta = "时间：{time}　|　讨论轮数：{n}　|　起草人：{d}　|　评委：{j}　|　表决：{t}".format(
+        time=data.get("time", ""), n=data.get("num_rounds", ""),
+        d=data.get("drafter", ""), j=data.get("judge", ""), t=tally_text)
     story.append(Paragraph(esc(meta), s["meta"]))
     story.append(Spacer(1, 4))
 
@@ -107,7 +111,7 @@ def build_story(data, s):
             story.append(Paragraph(esc(a.get("text", "")) or "（无内容）", s["body"]))
 
     # 最终方案
-    story.append(Paragraph("一、最终方案（定稿）", s["h1"]))
+    story.append(Paragraph("一、最终方案（评委裁决）", s["h1"]))
     story.append(Paragraph(esc(data.get("final", "")) or "（无内容）", s["body"]))
 
     # 方案草案
