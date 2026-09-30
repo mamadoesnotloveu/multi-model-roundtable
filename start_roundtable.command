@@ -1,7 +1,6 @@
 #!/bin/bash
 # 一键启动「多模型圆桌讨论」——双击即可运行，无需在终端输入命令。
-# 以脚本所在目录作为项目目录（脚本放在项目里双击即可；
-# 如需桌面快捷方式，可右键本脚本 -> 制作替身，把替身放到桌面）。
+# 启动后本终端窗口可安全关闭，程序会继续在后台运行。
 
 PROJECT_DIR="$(cd "$(dirname "$0")" && pwd)"
 
@@ -24,8 +23,15 @@ if [ ! -x "venv/bin/streamlit" ]; then
   echo "依赖安装完成。"
 fi
 
-echo "正在启动，浏览器将自动打开…"
-echo "（关闭本窗口即可退出程序）"
-# 等 Streamlit 起来后再打开浏览器
-( sleep 3; open "http://localhost:8501" ) &
-./venv/bin/streamlit run app.py
+# 后台启动 Streamlit（脱离本终端，关闭窗口不影响运行）
+LOG="$PROJECT_DIR/.streamlit_run.log"
+nohup ./venv/bin/streamlit run app.py >"$LOG" 2>&1 &
+
+# 等它起来后自动打开浏览器
+sleep 3
+open "http://localhost:8501"
+
+echo ""
+echo "✅ 已启动，浏览器将自动打开。"
+echo "   你现在可以安全关闭这个终端窗口了，程序会在后台继续运行。"
+echo "   如需停止：运行项目里的 stop_roundtable.command，或执行：lsof -ti :8501 | xargs kill"

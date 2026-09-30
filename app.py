@@ -17,6 +17,7 @@ from discussion import (
     run_discussion,
 )
 from file_reader import read_file_text
+import export_report
 
 # 项目根目录的 .env 文件（绝对路径，避免歧义）
 _ENV_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
@@ -142,6 +143,32 @@ def _render_discussion(data: dict) -> None:
                 with col:
                     st.markdown("**{}**".format(u.get("speaker", "")))
                     st.markdown(u.get("content", "") or "（无内容）")
+
+
+def _export_buttons(data: dict) -> None:
+    """渲染一键导出 Word / PDF 按钮（成果报告，不含话题/附件/过程）。"""
+    ts = data.get("time", "").replace(":", "").replace("-", "").replace(" ", "_") or "discussion"
+    try:
+        word_bytes = export_report.render_word(data)
+        pdf_bytes = export_report.render_pdf(data)
+    except Exception as exc:
+        st.error("导出失败：{}".format(exc))
+        return
+    c1, c2 = st.columns(2)
+    with c1:
+        st.download_button(
+            "⬇️ 导出 Word（成果报告）",
+            data=word_bytes,
+            file_name="圆桌讨论成果_{}.docx".format(ts),
+            mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        )
+    with c2:
+        st.download_button(
+            "⬇️ 导出 PDF（成果报告）",
+            data=pdf_bytes,
+            file_name="圆桌讨论成果_{}.pdf".format(ts),
+            mime="application/pdf",
+        )
 
 
 st.set_page_config(page_title="多模型圆桌讨论", layout="wide")
@@ -367,6 +394,9 @@ with tab_new:
             "num_rounds": num_rounds,
             "rounds_run": result["rounds_run"],
             "converged": result["converged"],
+            "athletes": result["athletes"],
+            "duration_seconds": result["duration_seconds"],
+            "usage": result["usage"],
             "attachments": attachments,
             "per_round": [
                 [{"speaker": u.speaker_label, "round": u.round_no, "content": u.content} for u in rnd]
@@ -389,6 +419,9 @@ with tab_new:
             st.error(err)
 
         _render_discussion(data)
+
+        st.markdown("---")
+        _export_buttons(data)
 
 with tab_history:
     items = _list_discussions()
@@ -416,6 +449,9 @@ with tab_history:
         )
         st.divider()
         _render_discussion(item["data"])
+
+        st.markdown("---")
+        _export_buttons(item["data"])
 
         st.markdown("---")
         st.markdown("### 多份讨论横向对比")

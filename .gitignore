@@ -20,6 +20,9 @@ discussions/
 # 导出的 PDF（个人内容，不提交）
 exports/
 
+# 运行日志
+.streamlit_run.log
+
 # 上传的 Office 文档（个人数据，不提交）
 *.docx
 *.pptx

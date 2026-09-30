@@ -13,6 +13,7 @@ from __future__ import annotations
 import queue
 import re
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import Callable, Iterator, Optional
@@ -146,8 +147,20 @@ def _build_messages(system: str, user_message: str) -> list:
     ]
 
 
-def call_model(cfg: ModelConfig, system: str, user_message: str, max_tokens: int = MAX_TOKENS) -> str:
-    """调用单个模型，返回其文本回复。失败会抛出异常。"""
+def _add_usage(usage, label: str, input_tokens, output_tokens) -> None:
+    """把一次调用的 token 用量累加到 usage[label] = {"input": int, "output": int}。"""
+    if usage is None:
+        return
+    u = usage.setdefault(label, {"input": 0, "output": 0})
+    try:
+        u["input"] += int(input_tokens or 0)
+        u["output"] += int(output_tokens or 0)
+    except (TypeError, ValueError):
+        pass
+
+
+def call_model(cfg: ModelConfig, system: str, user_message: str, max_tokens: int = MAX_TOKENS, usage: Optional[dict] = None) -> str:
+    """调用单个模型，返回其文本回复。失败会抛出异常。usage（可选）用于累加 token 用量。"""
     if cfg.provider == "claude":
         from anthropic import Anthropic
 
@@ -162,6 +175,10 @@ def call_model(cfg: ModelConfig, system: str, user_message: str, max_tokens: int
         for block in resp.content:
             if getattr(block, "type", "") == "text":
                 parts.append(block.text)
+        if usage is not None:
+            u = getattr(resp, "usage", None)
+            if u:
+                _add_usage(usage, cfg.label, getattr(u, "input_tokens", 0), getattr(u, "output_tokens", 0))
         return "".join(parts).strip()
 
     # OpenAI 兼容：openai / deepseek / grok
@@ -197,11 +214,15 @@ def call_model(cfg: ModelConfig, system: str, user_message: str, max_tokens: int
             messages=messages,
         )
 
+    if usage is not None:
+        u = getattr(resp, "usage", None)
+        if u:
+            _add_usage(usage, cfg.label, getattr(u, "prompt_tokens", 0), getattr(u, "completion_tokens", 0))
     return (resp.choices[0].message.content or "").strip()
 
 
-def call_model_stream(cfg: ModelConfig, system: str, user_message: str, max_tokens: int = MAX_TOKENS) -> Iterator[str]:
-    """流式调用单个模型，逐段 yield 文本。"""
+def call_model_stream(cfg: ModelConfig, system: str, user_message: str, max_tokens: int = MAX_TOKENS, usage: Optional[dict] = None) -> Iterator[str]:
+    """流式调用单个模型，逐段 yield 文本。usage（可选）用于累加 token 用量。"""
     if cfg.provider == "claude":
         from anthropic import Anthropic
 
@@ -215,6 +236,14 @@ def call_model_stream(cfg: ModelConfig, system: str, user_message: str, max_toke
             for text in stream.text_stream:
                 if text:
                     yield text
+            if usage is not None:
+                try:
+                    final_msg = stream.get_final_message()
+                    u = getattr(final_msg, "usage", None)
+                    if u:
+                        _add_usage(usage, cfg.label, getattr(u, "input_tokens", 0), getattr(u, "output_tokens", 0))
+                except Exception:
+                    pass
         return
 
     from openai import OpenAI
@@ -225,14 +254,20 @@ def call_model_stream(cfg: ModelConfig, system: str, user_message: str, max_toke
     kwargs = dict(model=cfg.name, stream=True, messages=messages)
     if cfg.provider == "openai":
         kwargs["max_completion_tokens"] = max_tokens
+        kwargs["stream_options"] = {"include_usage": True}
     else:
         kwargs["temperature"] = TEMPERATURE
         kwargs["max_tokens"] = max_tokens
 
     resp = client.chat.completions.create(**kwargs)
+    last_usage = None
     for chunk in resp:
+        if getattr(chunk, "usage", None):
+            last_usage = chunk.usage
         if chunk.choices and chunk.choices[0].delta and chunk.choices[0].delta.content:
             yield chunk.choices[0].delta.content
+    if usage is not None and last_usage is not None:
+        _add_usage(usage, cfg.label, getattr(last_usage, "prompt_tokens", 0), getattr(last_usage, "completion_tokens", 0))
 
 
 def format_transcript(utterances: list) -> str:
@@ -253,12 +288,12 @@ def format_votes(votes: list) -> str:
 
 
 def _call_participants_parallel(
-    participants: list, system: str, user_message: str, round_no: int, errors: list,
+    participants: list, system: str, user_message: str, round_no: int, errors: list, usage: Optional[dict] = None,
 ) -> list:
     """同一轮内并发调用所有参与模型（非流式）。"""
     def worker(cfg: ModelConfig) -> Utterance:
         try:
-            content = call_model(cfg, system, user_message)
+            content = call_model(cfg, system, user_message, usage=usage)
         except Exception as exc:
             errors.append("{label}（第 {rnd} 轮）调用失败：{exc}".format(
                 label=cfg.label, rnd=round_no, exc=exc))
@@ -271,7 +306,7 @@ def _call_participants_parallel(
 
 def _call_participants_streaming(
     participants: list, system: str, user_message: str, round_no: int, errors: list,
-    on_chunk: Optional[Callable[[str, str], None]],
+    on_chunk: Optional[Callable[[str, str], None]], usage: Optional[dict] = None,
 ) -> list:
     """同一轮内并发流式调用所有参与模型，主线程逐段回调 on_chunk(label, text)。"""
     n = len(participants)
@@ -279,7 +314,7 @@ def _call_participants_streaming(
 
     def worker(cfg: ModelConfig) -> None:
         try:
-            for text in call_model_stream(cfg, system, user_message):
+            for text in call_model_stream(cfg, system, user_message, usage=usage):
                 q.put((cfg.label, text, False))
         except Exception as exc:
             errors.append("{label}（第 {rnd} 轮）调用失败：{exc}".format(
@@ -310,14 +345,14 @@ def _call_participants_streaming(
     return [Utterance(cfg.label, round_no, texts[cfg.label]) for cfg in participants]
 
 
-def _check_convergence(checker: ModelConfig, context: str, transcript: str) -> bool:
+def _check_convergence(checker: ModelConfig, context: str, transcript: str, usage: Optional[dict] = None) -> bool:
     """用某个模型判断讨论是否已收敛。"""
     msg = (
         "{context}\n\n以下是讨论记录：\n\n{transcript}\n\n"
         "请判断以上讨论是否已收敛（各方没有新的实质性分歧、观点已趋于一致）。只回复两个字：收敛 或 未收敛"
     ).format(context=context, transcript=transcript)
     try:
-        ans = call_model(checker, CONVERGE_SYSTEM, msg, max_tokens=CONVERGE_MAX_TOKENS).strip()
+        ans = call_model(checker, CONVERGE_SYSTEM, msg, max_tokens=CONVERGE_MAX_TOKENS, usage=usage).strip()
     except Exception:
         return False
     return "收敛" in ans and "未" not in ans
@@ -335,10 +370,10 @@ def _tally_votes(votes: list) -> dict:
     return counts
 
 
-def _call_with_retry(cfg: ModelConfig, system: str, user_message: str, max_tokens: int, retries: int = 2) -> str:
+def _call_with_retry(cfg: ModelConfig, system: str, user_message: str, max_tokens: int, retries: int = 2, usage: Optional[dict] = None) -> str:
     """调用模型；若返回空内容则重试，最后仍为空则抛出异常。"""
     for _ in range(retries + 1):
-        out = call_model(cfg, system, user_message, max_tokens=max_tokens).strip()
+        out = call_model(cfg, system, user_message, max_tokens=max_tokens, usage=usage).strip()
         if out:
             return out
     raise RuntimeError("连续多次返回空内容")
@@ -367,6 +402,8 @@ def run_discussion(
     errors: list = []
     utterances: list = []
     per_round: list = []
+    usage: dict = {}
+    start_time = time.time()
 
     def emit(**ev: dict) -> None:
         if event_cb:
@@ -400,10 +437,11 @@ def run_discussion(
             round_utterances = _call_participants_streaming(
                 participants, DEBATER_SYSTEM, user_message, rnd, errors,
                 on_chunk=lambda label, text, rnd=rnd: emit(type="chunk", label=label, text=text),
+                usage=usage,
             )
         else:
             round_utterances = _call_participants_parallel(
-                participants, DEBATER_SYSTEM, user_message, rnd, errors)
+                participants, DEBATER_SYSTEM, user_message, rnd, errors, usage)
         utterances.extend(round_utterances)
         per_round.append(round_utterances)
         rounds_run = rnd
@@ -413,7 +451,7 @@ def run_discussion(
         # 从第 2 轮起判断是否收敛
         if rnd >= 2:
             emit(type="status", msg="正在判断讨论是否已收敛…")
-            if _check_convergence(drafter, context, format_transcript(utterances)):
+            if _check_convergence(drafter, context, format_transcript(utterances), usage):
                 converged = True
                 emit(type="status", msg="观点已收敛，提前结束辩论。")
                 break
@@ -432,7 +470,7 @@ def run_discussion(
         "- 草案要足够具体，便于其他成员逐条表决。"
     ).format(context=context, transcript=transcript)
     try:
-        draft = _call_with_retry(drafter, DRAFTER_SYSTEM, draft_message, DRAFT_MAX_TOKENS)
+        draft = _call_with_retry(drafter, DRAFTER_SYSTEM, draft_message, DRAFT_MAX_TOKENS, usage=usage)
     except Exception as exc:
         errors.append("起草人（{label}）起草失败：{exc}".format(label=drafter.label, exc=exc))
         draft = "（起草失败：{exc}）".format(exc=exc)
@@ -448,7 +486,7 @@ def run_discussion(
 
     def _vote_worker(cfg: ModelConfig) -> Vote:
         try:
-            content = _call_with_retry(cfg, VOTER_SYSTEM, vote_message, VOTE_MAX_TOKENS)
+            content = _call_with_retry(cfg, VOTER_SYSTEM, vote_message, VOTE_MAX_TOKENS, usage=usage)
         except Exception as exc:
             errors.append("{label}（表决）调用失败：{exc}".format(label=cfg.label, exc=exc))
             content = "（表决调用失败：{exc}）".format(exc=exc)
@@ -473,18 +511,22 @@ def run_discussion(
         "输出四部分：【最终方案】【各方盖章】【保留分歧】【依据说明】。"
     ).format(context=context, draft=draft, votes_text=votes_text, tally_text=tally_text)
     try:
-        final = _call_with_retry(judge, JUDGE_SYSTEM, judge_message, FINAL_MAX_TOKENS)
+        final = _call_with_retry(judge, JUDGE_SYSTEM, judge_message, FINAL_MAX_TOKENS, usage=usage)
     except Exception as exc:
         errors.append("评委（{label}）裁决失败：{exc}".format(label=judge.label, exc=exc))
         final = "（裁决失败：{exc}）".format(exc=exc)
 
     emit(type="status", msg="完成")
 
+    duration_seconds = int(time.time() - start_time)
     return {
         "topic": topic,
+        "athletes": [p.label for p in participants],
         "per_round": per_round,
         "rounds_run": rounds_run,
         "converged": converged,
+        "duration_seconds": duration_seconds,
+        "usage": usage,
         "transcript": transcript,
         "draft": draft,
         "votes": votes,
